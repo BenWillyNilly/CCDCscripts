@@ -13,5 +13,3 @@ Write-Host "`nCurrent Firewall Status:" -ForegroundColor Yellow
 Get-NetFirewallProfile |
 Select-Object Name, Enabled |
 Format-Table -AutoSize
-
-Pause
