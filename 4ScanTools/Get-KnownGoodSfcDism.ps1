@@ -29,12 +29,18 @@
        expected-hashes.csv (every genuine hash Winbindex has for this build, so
        you can check any candidate file on a trusted machine).
 
-    By default nothing is written to System32. With -Replace the script will
-    swap a bad installed file for a HASH-VERIFIED known-good copy (never for an
-    unverified one). The original is backed up to <output>\quarantine first,
-    ownership/ACLs are temporarily adjusted and then restored to
-    NT SERVICE\TrustedInstaller, and the result is re-verified (hash + signature).
-    Requires an elevated, 64-bit PowerShell and asks for confirmation
+    By default nothing is written to System32. With -Replace the script swaps
+    every installed file that is missing or not identical to the expected
+    Microsoft file (including genuine files of a different version). Source
+    preference:
+        1. a hash-verified copy (System32 / WinSxS / -SourceDir / symbol server)
+        2. a file you supplied in -SourceDir that Winbindex does not know
+        3. the Microsoft symbol-server variant (hash differs from the index)
+    Unverified sources (2 and 3) are used rather than leaving a bad file in
+    place; add -RequireVerified to refuse them. The original is always backed up
+    to <output>\quarantine first, ownership/ACLs are temporarily adjusted and then
+    restored to NT SERVICE\TrustedInstaller, and the result is re-checked (hash +
+    signature). Requires an elevated, 64-bit PowerShell and asks for confirmation
     (use -Confirm:$false to skip, -WhatIf to preview).
 
 .PARAMETER Files
@@ -56,19 +62,18 @@
     Analyse and compare only; download/copy nothing.
 
 .PARAMETER Replace
-    Replace installed files that are missing or NOT in Winbindex (i.e. modified /
-    replaced) with a hash-verified known-good copy. Files that are already
-    genuine are left alone.
+    Replace every installed file that is missing or not identical to the expected
+    Microsoft file. Files that are already identical are left alone.
 
-.PARAMETER ReplaceGenuineOtherVersion
-    With -Replace, also replace files that are genuine Microsoft files but a
-    different version than expected (skipped by default to avoid downgrades).
+.PARAMETER RequireVerified
+    With -Replace, only install hash-verified copies; refuse unverified sources.
 
 .PARAMETER SourceDir
     Folder containing known-good copies you obtained from a TRUSTED source (a
     clean machine of the same build, or files extracted from the install media).
-    A file there is only used if its SHA-256 is in Winbindex for this build and
-    architecture, so a wrong or tampered file is rejected.
+    Used first if its SHA-256 is in Winbindex for this build and architecture.
+    If Winbindex does not know the hash, the file is kept only as a last resort
+    (used if nothing verified can be found) unless -RequireVerified is set.
 
 .PARAMETER SkipLocalSearch
     Don't search WinSxS for genuine copies.
@@ -106,7 +111,7 @@
 param(
     [string[]]$Files = @('sfc.exe', 'dism.exe'),
     [switch]$Replace,
-    [switch]$ReplaceGenuineOtherVersion,
+    [switch]$RequireVerified,
     [string]$SourceDir,
     [string]$OutputDir,
     [string]$TargetVersion,
@@ -415,10 +420,21 @@ function Select-BestEntry {
         })
     }
 
+    # All downloadable candidates, closest to this OS's update level first.
+    $ranked = @()
+    $ranked += @($cands | Where-Object { $_.Ubr -eq $OsUbr } | Sort-Object -Property Timestamp -Descending)
+    if ($MatchMode -eq 'Nearest') {
+        $ranked += @($cands | Where-Object { $_.Ubr -lt $OsUbr } |
+            Sort-Object -Property @{ Expression = 'Ubr'; Descending = $true }, @{ Expression = 'Timestamp'; Descending = $true })
+        $ranked += @($cands | Where-Object { $_.Ubr -gt $OsUbr } |
+            Sort-Object -Property @{ Expression = 'Ubr'; Descending = $false }, @{ Expression = 'Timestamp'; Descending = $true })
+    }
+
     $result = [pscustomobject]@{
         Selected = $null; Tier = $null; Alternates = 0
         ForBuild = $forBuild; Downloadable = $cands.Count; Reason = $null
         Hashes   = @($allBuild | Sort-Object -Property Ubr)
+        Ranked   = $ranked
     }
 
     if ($forBuild -eq 0) {
@@ -582,7 +598,7 @@ function Test-DownloadedFile {
 function Save-KnownGoodFile {
     # Downloads from the symbol server. Returns Verified=$true only if the SHA-256
     # equals the Winbindex hash; otherwise the file is parked in .\unverified.
-    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)]$Sel, [Parameter(Mandatory)][string]$DestDir)
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)]$Sel, [Parameter(Mandatory)][string]$DestDir, [switch]$VerifiedOnly)
 
     $dest = Join-Path $DestDir $Name
     $out  = [ordered]@{
@@ -636,6 +652,13 @@ function Save-KnownGoodFile {
         return [pscustomobject]$out
     }
 
+    if ($VerifiedOnly) {
+        # Probing alternative versions: discard anything that is not hash-verified.
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        $out.Path = ''
+        return [pscustomobject]$out
+    }
+
     # Different variant served: keep it, but quarantine it under "unverified".
     $uDir = Join-Path $DestDir 'unverified'
     New-Item -ItemType Directory -Path $uDir -Force | Out-Null
@@ -669,7 +692,7 @@ function Invoke-Native {
     [pscustomobject]@{ ExitCode = $code; Output = ($out -join ' ').Trim() }
 }
 
-function Install-VerifiedFile {
+function Install-ReplacementFile {
     # Replaces $Target with $Source after re-verifying $Source's SHA-256.
     #   1. backs the existing file up (and verifies the backup) BEFORE touching anything
     #   2. takes ownership / grants Administrators full control on the old file
@@ -918,6 +941,7 @@ try {
                 $res.Status = 'Matched (not downloaded)'
             } else {
                 $verifiedPath = $null
+                $sourceDirFallback = $null
                 $destFile = Join-Path $destDir $name
 
                 # (a) a copy we already trust: the installed file if identical, else a genuine copy in WinSxS
@@ -955,7 +979,12 @@ try {
                         $sh  = (Get-FileHash -LiteralPath $sp -Algorithm SHA256).Hash.ToLowerInvariant()
                         Write-Log "Checking $sp (SHA-256 $sh) against Winbindex..."
                         if (-not $index.ContainsKey($sh)) {
-                            Write-Log "Rejected: the SHA-256 of $sp is NOT in Winbindex, so it is not a known Microsoft file." 'ERROR'
+                            if ($RequireVerified) {
+                                Write-Log "Rejected: the SHA-256 of $sp is NOT in Winbindex, so it is not a known Microsoft file (-RequireVerified is set)." 'ERROR'
+                            } else {
+                                $sourceDirFallback = $sp
+                                Write-Log "The SHA-256 of $sp is NOT in Winbindex, so it is not a known Microsoft file. It will be used only as a last resort if nothing verified can be found." 'WARN'
+                            }
                         } else {
                             $sfi  = Get-Val $index[$sh] 'fileInfo'
                             $smt  = Get-Val $sfi 'machineType'
@@ -966,7 +995,12 @@ try {
                                 $pick = [pscustomobject]@{ Path = $sp; Sha256 = $sh; Version = $sver; Where = 'SourceDir (hash-verified)' }
                                 Write-Log "Accepted: genuine Microsoft $name, version $sver." 'OK'
                             } else {
-                                Write-Log "Rejected: $sp is a genuine Microsoft file (version $sver) but not for this build/architecture, or newer than this OS's update level." 'ERROR'
+                                if ($RequireVerified) {
+                                    Write-Log "Rejected: $sp is a genuine Microsoft file (version $sver) but not for this build/architecture, or newer than this OS's update level (-RequireVerified is set)." 'ERROR'
+                                } else {
+                                    $sourceDirFallback = $sp
+                                    Write-Log "$sp is a genuine Microsoft file (version $sver) but not for this build/architecture, or newer than this OS's update level. It will be used only as a last resort." 'WARN'
+                                }
                             }
                         }
                     }
@@ -991,33 +1025,59 @@ try {
                     }
                 }
 
-                # (b) symbol server
+                # (b) symbol server: expected version first; if that does not yield a hash-verified file,
+                #     try the other indexed versions of this build (the server may hold a matching file for one of them)
                 if (-not $SkipDownload) {
-                    try {
-                        $saved = Save-KnownGoodFile -Name $name -Sel $best -DestDir $destDir
-                        $res.SymbolServerUrl = $saved.Url
-                        if ($saved.Reused) {
-                            $res.SymbolServer = 'Skipped (verified copy already present)'
-                        } elseif ($saved.Verified) {
-                            $res.SymbolServer = 'Verified (hash matches Winbindex)'
-                            Write-Log "Symbol-server download of $name matches the Winbindex hash." 'OK'
-                            if (-not $verifiedPath) {
-                                $verifiedPath = $saved.Path
-                                $res.Source = 'Symbol server (hash-verified)'
-                                $res.ProvidedVersion = $best.Version
-                                $res.ProvidedSha256  = $best.Sha256
+                    $tryList = @($best)
+                    $tryList += @($sel.Ranked | Where-Object { $_.Sha256 -ne $best.Sha256 } | Select-Object -First 5)
+                    $attempt = 0
+                    foreach ($cand in $tryList) {
+                        $attempt++
+                        if ($attempt -gt 1 -and $verifiedPath) { break }
+                        if ($attempt -gt 1) { Write-Log "Trying indexed version $($cand.Version) of $name in case the server holds a matching file for it..." 'DEBUG' }
+                        try {
+                            if ($attempt -eq 1) {
+                                $saved = Save-KnownGoodFile -Name $name -Sel $cand -DestDir $destDir
+                                $res.SymbolServerUrl = $saved.Url
+                            } else {
+                                $saved = Save-KnownGoodFile -Name $name -Sel $cand -DestDir $destDir -VerifiedOnly
                             }
-                        } else {
-                            $res.SymbolServer  = 'UNVERIFIED variant (hash differs from Winbindex)'
-                            $res.UnverifiedPath = $saved.Path
-                            Write-Log ("The symbol server returned a DIFFERENT variant of {0} (SHA-256 {1}, version {2}). Winbindex's author notes it sometimes serves unsigned development builds under the same key. Saved to '{3}' for reference only - do NOT treat it as known-good." -f `
-                                $name, $saved.DownloadedSha256, $saved.DownloadedVersion, $saved.Path) 'WARN'
-                            foreach ($pr in $saved.Verification.Problems) { Write-Log "  - $pr" 'DEBUG' }
+
+                            if ($saved.Reused) {
+                                if (-not $verifiedPath) {
+                                    $verifiedPath = $saved.Path
+                                    $res.Source = 'Earlier download (hash-verified)'
+                                    $res.ProvidedVersion = $cand.Version
+                                    $res.ProvidedSha256  = $cand.Sha256
+                                }
+                                if ($attempt -eq 1) { $res.SymbolServer = 'Skipped (verified copy already present)' }
+                            } elseif ($saved.Verified) {
+                                $res.SymbolServer = "Verified (hash matches Winbindex, version $($cand.Version))"
+                                Write-Log "Symbol-server download of $name (version $($cand.Version)) matches the Winbindex hash." 'OK'
+                                if (-not $verifiedPath) {
+                                    $verifiedPath = $saved.Path
+                                    $res.Source = 'Symbol server (hash-verified)'
+                                    $res.ProvidedVersion = $cand.Version
+                                    $res.ProvidedSha256  = $cand.Sha256
+                                }
+                            } elseif ($attempt -eq 1) {
+                                $res.SymbolServer   = 'UNVERIFIED variant (hash differs from Winbindex)'
+                                $res.UnverifiedPath = $saved.Path
+                                Write-Log ("The symbol server returned a DIFFERENT variant of {0} (SHA-256 {1}, version {2}); Winbindex's author notes it sometimes serves unsigned development builds under the same key. Saved to '{3}'." -f `
+                                    $name, $saved.DownloadedSha256, $saved.DownloadedVersion, $saved.Path) 'WARN'
+                                foreach ($pr in $saved.Verification.Problems) { Write-Log "  - $pr" 'DEBUG' }
+                            } else {
+                                Write-Log "Version $($cand.Version) of $name also came back as a different variant." 'DEBUG'
+                            }
+                        } catch {
+                            if ($attempt -eq 1) {
+                                $res.SymbolServer = 'Failed: ' + $_.Exception.Message
+                                Write-Log "Symbol server: $($_.Exception.Message)" 'WARN'
+                                if (-not $verifiedPath) { $res.Error = $_.Exception.Message }
+                            } else {
+                                Write-Log "Version $($cand.Version): $($_.Exception.Message)" 'DEBUG'
+                            }
                         }
-                    } catch {
-                        $res.SymbolServer = 'Failed: ' + $_.Exception.Message
-                        Write-Log "Symbol server: $($_.Exception.Message)" 'WARN'
-                        if (-not $verifiedPath) { $res.Error = $_.Exception.Message }
                     }
                 }
 
@@ -1030,7 +1090,7 @@ try {
                     $res.Status = 'Unverified'
                     $res.Path   = $res.UnverifiedPath
                     $exitCode = 1
-                    Write-Log "Result: only an UNVERIFIED $name is available. Get a genuine copy from a trusted machine or the install media and check its SHA-256 against expected-hashes.csv." 'ERROR'
+                    Write-Log "Result: no hash-verified copy of $name is available; only an UNVERIFIED symbol-server variant was obtained (saved under 'unverified')." 'WARN'
                 } else {
                     $res.Status = 'Failed'
                     $exitCode = 1
@@ -1039,40 +1099,55 @@ try {
 
                 # ---- optional: replace the installed file ----
                 if ($Replace) {
-                    $needs = $false
                     if ($res.LocalStatus -eq 'Identical') {
                         $res.Replacement = 'Not needed (already genuine)'
-                        Write-Log "Installed $name is already genuine; nothing to replace." 'OK'
-                    } elseif ($res.LocalStatus -like 'GenuineOtherVersion*' -and -not $ReplaceGenuineOtherVersion) {
-                        $res.Replacement = 'Skipped (genuine, other version; use -ReplaceGenuineOtherVersion)'
-                        Write-Log "Installed $name is genuine Microsoft code of another version; leaving it. Use -ReplaceGenuineOtherVersion to replace it anyway." 'WARN'
+                        Write-Log "Installed $name is already identical to the expected Microsoft file; nothing to replace." 'OK'
                     } else {
-                        $needs = $true
-                    }
-
-                    if ($needs -and -not $verifiedPath) {
-                        $res.Replacement = 'NOT replaced: no hash-verified source available'
-                        Write-Log "Cannot replace $name: no hash-verified copy is available, and unverified files are never installed. Provide one with -SourceDir (from a clean machine or the install media)." 'ERROR'
-                        $exitCode = 1
-                    } elseif ($needs) {
-                        $target = Join-Path $script:SysDir $name
-                        $action = "Replace with hash-verified $name $($res.ProvidedVersion) (SHA-256 $($res.ProvidedSha256)); original is backed up first"
-                        if ($PSCmdlet.ShouldProcess($target, $action)) {
-                            try {
-                                $ins = Install-VerifiedFile -Source $verifiedPath -Target $target `
-                                    -ExpectedSha256 $res.ProvidedSha256 -QuarantineDir (Join-Path $destDir 'quarantine')
-                                $res.Replacement = 'Replaced'
-                                $res.BackupPath  = $ins.BackupPath
-                                Write-Log "REPLACED $target with verified $name (signature: $($ins.Signature))." 'OK'
-                                if ($ins.BackupPath) { Write-Log "Original saved as evidence: $($ins.BackupPath) (do not run it)." 'INFO' }
-                                foreach ($n in $ins.Notes) { Write-Log $n 'WARN' }
-                            } catch {
-                                $res.Replacement = 'FAILED: ' + $_.Exception.Message
-                                Write-Log "Replacement of $name failed: $($_.Exception.Message)" 'ERROR'
-                                $exitCode = 1
+                        # best source available: hash-verified > file supplied via -SourceDir > symbol-server variant
+                        $srcPath  = $null
+                        $srcLabel = ''
+                        if ($verifiedPath) {
+                            $srcPath = $verifiedPath; $srcLabel = 'hash-verified'
+                        } elseif (-not $RequireVerified) {
+                            if ($sourceDirFallback) {
+                                $srcPath = $sourceDirFallback; $srcLabel = 'UNVERIFIED (supplied via -SourceDir)'
+                            } elseif ($res.UnverifiedPath) {
+                                $srcPath = $res.UnverifiedPath; $srcLabel = 'UNVERIFIED (Microsoft symbol-server variant)'
                             }
+                        }
+
+                        if (-not $srcPath) {
+                            $res.Replacement = 'NOT replaced: no replacement file available'
+                            if ($RequireVerified) {
+                                Write-Log "Cannot replace ${name}: no hash-verified copy is available and -RequireVerified is set." 'ERROR'
+                            } else {
+                                Write-Log "Cannot replace ${name}: no replacement file could be obtained from the local component store, -SourceDir or the symbol server. Provide one with -SourceDir." 'ERROR'
+                            }
+                            $exitCode = 1
                         } else {
-                            $res.Replacement = 'Not performed (declined / -WhatIf)'
+                            $srcHash = (Get-FileHash -LiteralPath $srcPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                            if ($srcLabel -ne 'hash-verified') {
+                                Write-Log "No hash-verified copy of $name exists. Installing the $srcLabel file anyway (SHA-256 $srcHash): $srcPath" 'WARN'
+                            }
+                            $target = Join-Path $script:SysDir $name
+                            $action = "Replace with $srcLabel $name (SHA-256 $srcHash); the original is backed up first"
+                            if ($PSCmdlet.ShouldProcess($target, $action)) {
+                                try {
+                                    $ins = Install-ReplacementFile -Source $srcPath -Target $target `
+                                        -ExpectedSha256 $srcHash -QuarantineDir (Join-Path $destDir 'quarantine')
+                                    if ($srcLabel -eq 'hash-verified') { $res.Replacement = 'Replaced' } else { $res.Replacement = 'Replaced (UNVERIFIED source)' }
+                                    $res.BackupPath = $ins.BackupPath
+                                    Write-Log "REPLACED $target using the $srcLabel copy (signature now: $($ins.Signature))." 'OK'
+                                    if ($ins.BackupPath) { Write-Log "Original saved as evidence: $($ins.BackupPath) (do not run it)." 'INFO' }
+                                    foreach ($n in $ins.Notes) { Write-Log $n 'WARN' }
+                                } catch {
+                                    $res.Replacement = 'FAILED: ' + $_.Exception.Message
+                                    Write-Log "Replacement of $name failed: $($_.Exception.Message)" 'ERROR'
+                                    $exitCode = 1
+                                }
+                            } else {
+                                $res.Replacement = 'Not performed (declined / -WhatIf)'
+                            }
                         }
                     }
                 }
@@ -1102,7 +1177,7 @@ try {
     $results | Select-Object File, Status, Source, ExpectedVersion, LocalStatus, Replacement |
         Format-Table -AutoSize | Out-String -Width 260 | Write-Host
 
-    if (@($results | Where-Object { $_.Replacement -eq 'Replaced' }).Count -gt 0) {
+    if (@($results | Where-Object { $_.Replacement -like 'Replaced*' }).Count -gt 0) {
         Write-Log 'Next steps: run "sfc /verifyonly" and "DISM /Online /Cleanup-Image /ScanHealth" to confirm the system is consistent, and investigate how the originals were replaced (see the quarantine folder; do not execute those files).' 'WARN'
     }
 
