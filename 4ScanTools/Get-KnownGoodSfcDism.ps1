@@ -244,11 +244,12 @@ function ConvertFrom-JsonLarge {
 
 function Get-SignatureInfo {
     param([Parameter(Mandatory)][string]$Path)
-    $o = [pscustomobject]@{ Status = 'Unavailable'; Signer = '' }
+    $o = [pscustomobject]@{ Status = 'Unavailable'; Signer = ''; IsOSBinary = $null }
     try {
         $s = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
         $o.Status = $s.Status.ToString()
         if ($s.SignerCertificate) { $o.Signer = $s.SignerCertificate.Subject }
+        if ($s.PSObject.Properties['IsOSBinary']) { $o.IsOSBinary = [bool]$s.IsOSBinary }
     } catch { }
     return $o
 }
@@ -486,41 +487,47 @@ function Get-LocalFileInfo {
         Owner         = $owner
         Signature     = $sig.Status
         Signer        = $sig.Signer
+        IsOSBinary    = $sig.IsOSBinary
     }
 }
 
 function Find-GenuineLocalCopies {
     # Searches the component store for copies of $Name whose SHA-256 appears in the
     # Winbindex index for this CPU architecture. Such a copy is genuine Microsoft code.
+    # Returns zero or more objects (callers should wrap the call in @()).
     param([Parameter(Mandatory)][string]$Name, $Index, [int]$MachineType)
 
     $root  = Join-Path $env:windir 'WinSxS'
-    $found = New-Object System.Collections.Generic.List[object]
-    if (-not (Test-Path -LiteralPath $root)) { return ,@() }
+    $found = @()
+    if (-not (Test-Path -LiteralPath $root)) { return $found }
 
     $seen  = @{}
-    $items = Get-ChildItem -LiteralPath $root -Recurse -Filter $Name -File -Force -ErrorAction SilentlyContinue
-    foreach ($f in $items) {
-        $h = $null
-        try { $h = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop).Hash } catch { continue }
-        if (-not $h) { continue }
-        $h = $h.ToLowerInvariant()
+    $paths = @(Get-ChildItem -LiteralPath $root -Recurse -Filter $Name -Force -ErrorAction SilentlyContinue |
+               Where-Object { -not $_.PSIsContainer } |
+               ForEach-Object { $_.FullName })
+
+    foreach ($path in $paths) {
+        $hashObj = Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction SilentlyContinue
+        if ($null -eq $hashObj) { continue }
+        $h = ([string]$hashObj.Hash).ToLowerInvariant()
         if ($seen.ContainsKey($h)) { continue }
         $seen[$h] = $true
         if (-not $Index.ContainsKey($h)) { continue }
 
         $fi = Get-Val $Index[$h] 'fileInfo'
         $mt = Get-Val $fi 'machineType'
-        if ($null -eq $mt -or [int]$mt -ne $MachineType) { continue }
-        $ver = [string](Get-Val $fi 'version')
-        if (-not ($ver -match '^(\d+)\.(\d+)\.(\d+)\.(\d+)')) { continue }
+        if ($null -eq $mt) { continue }
+        if ([int]$mt -ne $MachineType) { continue }
 
-        $found.Add([pscustomobject]@{
-            Path = $f.FullName; Sha256 = $h; Version = $ver
-            Build = [int]$Matches[3]; Ubr = [int]$Matches[4]
-        })
+        $ver = [string](Get-Val $fi 'version')
+        if ($ver -match '^(\d+)\.(\d+)\.(\d+)\.(\d+)') {
+            $found += [pscustomobject]@{
+                Path = $path; Sha256 = $h; Version = $ver
+                Build = [int]$Matches[3]; Ubr = [int]$Matches[4]
+            }
+        }
     }
-    return ,@($found)
+    return $found
 }
 
 # =============================================================================
@@ -831,7 +838,7 @@ try {
             ProvidedVersion = ''; ProvidedSha256 = ''
             SymbolServer = ''; SymbolServerUrl = ''; UnverifiedPath = ''; WindowsReleases = ''
             LocalStatus = ''; LocalVersion = ''; LocalSha256 = ''; LocalSize = ''
-            LocalModifiedUtc = ''; LocalOwner = ''; LocalSignature = ''
+            LocalModifiedUtc = ''; LocalOwner = ''; LocalSignature = ''; LocalSigner = ''
             Replacement = ''; BackupPath = ''
             ExpectedHashesThisBuild = @(); Error = ''
         }
@@ -874,10 +881,11 @@ try {
             } else {
                 $res.LocalVersion = $local.Version; $res.LocalSha256 = $local.Sha256
                 $res.LocalSize = $local.Size; $res.LocalModifiedUtc = $local.ModifiedUtc
-                $res.LocalOwner = $local.Owner; $res.LocalSignature = $local.Signature
+                $res.LocalOwner = $local.Owner; $res.LocalSignature = $local.Signature; $res.LocalSigner = $local.Signer
 
                 Write-Log ("Installed copy: {0} bytes, version {1}, modified {2} UTC, owner {3}, signature {4}" -f `
                     $local.Size, $local.Version, $local.ModifiedUtc, $local.Owner, $local.Signature)
+                if ($local.Signer) { Write-Log "Signed by: $($local.Signer)" }
                 Write-Log "Installed SHA-256: $($local.Sha256)"
 
                 if ($local.NoVersionInfo) {
@@ -888,6 +896,8 @@ try {
                 }
                 if ($local.Signature -ne 'Valid') {
                     Write-Log "Signature status is '$($local.Signature)' (a genuine, unmodified Windows binary normally validates as 'Valid')." 'WARN'
+                } elseif ($null -ne $local.IsOSBinary -and -not $local.IsOSBinary) {
+                    Write-Log "Signature is 'Valid' but is NOT a Windows OS-binary signature. 'Valid' only means the signing chain ends at a root this machine trusts; a rogue root CA would make attacker-signed files look valid. Inspect the signing chain and the Root stores." 'ERROR'
                 }
 
                 if ($local.Sha256 -eq $best.Sha256) {
@@ -916,7 +926,12 @@ try {
                     $pick = [pscustomobject]@{ Path = $local.Path; Sha256 = $local.Sha256; Version = $best.Version; Where = 'System32 (hash-verified)' }
                 } elseif (-not $SkipLocalSearch -and -not $os.IsOverride) {
                     Write-Log 'Searching the component store (WinSxS) for genuine copies - this can take a minute...'
-                    $found = @(Find-GenuineLocalCopies -Name $name -Index $index -MachineType $os.MachineType)
+                    $found = @()
+                    try {
+                        $found = @(Find-GenuineLocalCopies -Name $name -Index $index -MachineType $os.MachineType)
+                    } catch {
+                        Write-Log ("WinSxS search failed and was skipped: {0} (script line {1})" -f $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber) 'WARN'
+                    }
                     Write-Log ("Found {0} genuine copy/copies of {1} in WinSxS." -f $found.Count, $name) 'DEBUG'
                     $cand = @($found | Where-Object { $_.Build -eq $os.Build })
                     $p1 = $cand | Where-Object { $_.Sha256 -eq $best.Sha256 } | Select-Object -First 1
@@ -1066,6 +1081,7 @@ try {
             $res.Status = 'Failed'
             $res.Error  = $_.Exception.Message
             Write-Log "$name : $($res.Error)" 'ERROR'
+            Write-Log ("  at script line {0}: {1}" -f $_.InvocationInfo.ScriptLineNumber, ([string]$_.InvocationInfo.Line).Trim()) 'DEBUG'
             $exitCode = 1
         }
 
