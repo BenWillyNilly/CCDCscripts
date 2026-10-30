@@ -111,23 +111,63 @@ try {
     # ------------------------------------------------------------ enumerate certs
     Write-Host "`nEnumerating certificate stores..." -ForegroundColor Cyan
 
+    # Uses the .NET X509Store API directly (does not depend on the Cert: drive).
     $all = New-Object System.Collections.Generic.List[object]
+
+    $storeLocations = @{
+        'LocalMachine' = [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+        'CurrentUser'  = [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+    }
+    $registryRoots = @{
+        'LocalMachine' = 'HKLM:\SOFTWARE\Microsoft\SystemCertificates'
+        'CurrentUser'  = 'HKCU:\SOFTWARE\Microsoft\SystemCertificates'
+    }
+    $wellKnownStores = 'My', 'Root', 'CA', 'AuthRoot', 'TrustedPeople',
+                       'TrustedPublisher', 'Disallowed', 'AddressBook', 'ThirdPartyRoot'
+    $openFlags = [System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly -bor
+                 [System.Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly
+
     foreach ($loc in 'LocalMachine', 'CurrentUser') {
-        $stores = Get-ChildItem "Cert:\$loc" -ErrorAction SilentlyContinue
-        foreach ($store in $stores) {
-            $certs = Get-ChildItem $store.PSPath -ErrorAction SilentlyContinue
-            foreach ($c in $certs) {
-                if ($c.PSIsContainer -or -not $c.RawData) { continue }
-                $all.Add([pscustomobject]@{
-                    Location = $loc
-                    Store    = $store.Name
-                    Cert     = $c
-                })
+        # Hashtables are case-insensitive in PowerShell, so this de-duplicates store names.
+        $storeNames = @{}
+        foreach ($n in $wellKnownStores) { $storeNames[$n] = $true }
+        if (Test-Path $registryRoots[$loc]) {
+            foreach ($k in (Get-ChildItem $registryRoots[$loc] -ErrorAction SilentlyContinue)) {
+                $storeNames[$k.PSChildName] = $true
             }
+        }
+
+        foreach ($name in ($storeNames.Keys | Sort-Object)) {
+            $store = $null
+            $count = 0
+            try {
+                $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($name, $storeLocations[$loc])
+                $store.Open($openFlags)
+                foreach ($c in $store.Certificates) {
+                    if (-not $c.RawData) { continue }
+                    $all.Add([pscustomobject]@{
+                        Location = $loc
+                        Store    = $name
+                        Cert     = $c
+                    })
+                    $count++
+                }
+            } catch {
+                Write-Warning ("Could not read {0}\{1}: {2}" -f $loc, $name, $_.Exception.Message)
+            } finally {
+                if ($store) { $store.Close() }
+            }
+            if ($count -gt 0) { Write-Host ("  {0}\{1}: {2}" -f $loc, $name, $count) -ForegroundColor DarkGray }
         }
     }
     Write-Host ("Found {0} certificate entries ({1} unique thumbprints)." -f `
         $all.Count, ($all.Cert.Thumbprint | Sort-Object -Unique).Count)
+
+    if ($all.Count -eq 0) {
+        Write-Warning "No certificates could be read from the Windows stores."
+        Write-Warning "Check that you're running as Administrator and that PowerShell isn't in Constrained Language Mode (`$ExecutionContext.SessionState.LanguageMode)."
+        return
+    }
 
     # ------------------------------------------------------------ build trust bundles
     $rootPem  = Join-Path $work 'roots.pem'
