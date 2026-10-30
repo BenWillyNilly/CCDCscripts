@@ -29,7 +29,13 @@
        expected-hashes.csv (every genuine hash Winbindex has for this build, so
        you can check any candidate file on a trusted machine).
 
-    Nothing is ever written to System32.
+    By default nothing is written to System32. With -Replace the script will
+    swap a bad installed file for a HASH-VERIFIED known-good copy (never for an
+    unverified one). The original is backed up to <output>\quarantine first,
+    ownership/ACLs are temporarily adjusted and then restored to
+    NT SERVICE\TrustedInstaller, and the result is re-verified (hash + signature).
+    Requires an elevated, 64-bit PowerShell and asks for confirmation
+    (use -Confirm:$false to skip, -WhatIf to preview).
 
 .PARAMETER Files
     Files to look up. Default: sfc.exe, dism.exe.
@@ -48,6 +54,21 @@
 
 .PARAMETER ListOnly
     Analyse and compare only; download/copy nothing.
+
+.PARAMETER Replace
+    Replace installed files that are missing or NOT in Winbindex (i.e. modified /
+    replaced) with a hash-verified known-good copy. Files that are already
+    genuine are left alone.
+
+.PARAMETER ReplaceGenuineOtherVersion
+    With -Replace, also replace files that are genuine Microsoft files but a
+    different version than expected (skipped by default to avoid downgrades).
+
+.PARAMETER SourceDir
+    Folder containing known-good copies you obtained from a TRUSTED source (a
+    clean machine of the same build, or files extracted from the install media).
+    A file there is only used if its SHA-256 is in Winbindex for this build and
+    architecture, so a wrong or tampered file is rejected.
 
 .PARAMETER SkipLocalSearch
     Don't search WinSxS for genuine copies.
@@ -81,9 +102,12 @@
     file has no verified copy, 2 = fatal error. Admin rights recommended (WinSxS,
     ownership info). Works on Windows PowerShell 5.1 and PowerShell 7+.
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [string[]]$Files = @('sfc.exe', 'dism.exe'),
+    [switch]$Replace,
+    [switch]$ReplaceGenuineOtherVersion,
+    [string]$SourceDir,
     [string]$OutputDir,
     [string]$TargetVersion,
     [ValidateSet('Auto', 'x64', 'x86', 'arm64')]
@@ -617,6 +641,125 @@ function Save-KnownGoodFile {
 }
 
 # =============================================================================
+# Replacement helpers
+# =============================================================================
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$Exe, [string[]]$Arguments)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out  = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    [pscustomobject]@{ ExitCode = $code; Output = ($out -join ' ').Trim() }
+}
+
+function Install-VerifiedFile {
+    # Replaces $Target with $Source after re-verifying $Source's SHA-256.
+    #   1. backs the existing file up (and verifies the backup) BEFORE touching anything
+    #   2. takes ownership / grants Administrators full control on the old file
+    #   3. stages the new file next to the target, verifies it, then swaps it in
+    #      (rolls back from the backup if the swap fails)
+    #   4. restores owner = NT SERVICE\TrustedInstaller and default inherited ACLs
+    #   5. re-verifies the installed file (hash + Authenticode/catalog signature)
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][string]$ExpectedSha256,
+        [Parameter(Mandatory)][string]$QuarantineDir
+    )
+
+    $expected = $ExpectedSha256.ToLowerInvariant()
+    $name     = [IO.Path]::GetFileName($Target)
+    $dir      = Split-Path -Parent $Target
+    $stamp    = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+    $r = [ordered]@{ Success = $false; BackupPath = ''; Signature = ''; Notes = @() }
+
+    # 1. the source must still be exactly what we verified
+    $srcHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($srcHash -ne $expected) { throw "Source file hash is $srcHash, expected $expected; refusing to install." }
+
+    $existed = Test-Path -LiteralPath $Target -PathType Leaf
+    $backup  = $null
+
+    # 2. evidence backup, verified before any change is made
+    if ($existed) {
+        New-Item -ItemType Directory -Path $QuarantineDir -Force | Out-Null
+        $oldHash = (Get-FileHash -LiteralPath $Target -Algorithm SHA256).Hash.ToLowerInvariant()
+        $backup  = Join-Path $QuarantineDir ('{0}.{1}.{2}.quarantine' -f $name, $stamp, $oldHash.Substring(0, 12))
+        Copy-Item -LiteralPath $Target -Destination $backup -Force
+        if ((Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash.ToLowerInvariant() -ne $oldHash) {
+            throw 'Backup verification failed; nothing was changed.'
+        }
+        $r.BackupPath = $backup
+
+        # 3. permissions: Administrators need full control to replace a TrustedInstaller-owned file
+        $t = Invoke-Native 'takeown.exe' @('/F', $Target, '/A')
+        if ($t.ExitCode -ne 0) { throw "takeown failed: $($t.Output)" }
+        $g = Invoke-Native 'icacls.exe' @($Target, '/grant', '*S-1-5-32-544:(F)')
+        if ($g.ExitCode -ne 0) { throw "icacls /grant failed: $($g.Output)" }
+    }
+
+    # 4. stage -> verify -> swap
+    $staged = Join-Path $dir ('{0}.new-{1}' -f $name, $stamp)
+    $moved  = $null
+    try {
+        Copy-Item -LiteralPath $Source -Destination $staged -Force -ErrorAction Stop
+        if ((Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Staged copy failed hash verification.'
+        }
+
+        if ($existed) {
+            try {
+                Remove-Item -LiteralPath $Target -Force -ErrorAction Stop
+            } catch {
+                # A running executable can be renamed but not deleted.
+                $moved = '{0}.replaced-{1}' -f $name, $stamp
+                Rename-Item -LiteralPath $Target -NewName $moved -Force -ErrorAction Stop
+                $r.Notes += "The old file is in use; it was renamed to $moved (find and stop the process using it, then delete it)."
+            }
+        }
+        Rename-Item -LiteralPath $staged -NewName $name -Force -ErrorAction Stop
+    } catch {
+        $err = $_.Exception.Message
+        # roll back so the system is never left without the file
+        if ($existed -and -not (Test-Path -LiteralPath $Target)) {
+            if ($moved -and (Test-Path -LiteralPath (Join-Path $dir $moved))) {
+                Rename-Item -LiteralPath (Join-Path $dir $moved) -NewName $name -Force -ErrorAction SilentlyContinue
+            } elseif ($backup) {
+                Copy-Item -LiteralPath $backup -Destination $Target -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
+        throw "Swap failed and was rolled back: $err"
+    }
+
+    # 5. restore ownership and default ACLs
+    $o = Invoke-Native 'icacls.exe' @($Target, '/setowner', 'NT SERVICE\TrustedInstaller')
+    if ($o.ExitCode -ne 0) { $r.Notes += "Could not restore TrustedInstaller ownership: $($o.Output)" }
+    $p = Invoke-Native 'icacls.exe' @($Target, '/reset')
+    if ($p.ExitCode -ne 0) { $r.Notes += "Could not reset default ACLs: $($p.Output)" }
+
+    # 6. final verification
+    $final = (Get-FileHash -LiteralPath $Target -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($final -ne $expected) { throw "Installed file hash is $final, expected $expected." }
+    $sig = Get-SignatureInfo -Path $Target
+    $r.Signature = $sig.Status
+    if ($sig.Status -ne 'Valid') { $r.Notes += "Signature status is '$($sig.Status)' (expected 'Valid' for a genuine Windows binary)." }
+
+    $r.Success = $true
+    return [pscustomobject]$r
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -639,6 +782,14 @@ try {
     if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
         $script:SysDir = Join-Path $env:windir 'Sysnative'
         Write-Log '32-bit PowerShell on 64-bit Windows detected; using Sysnative to read the real System32.' 'DEBUG'
+    }
+
+    if ($Replace) {
+        if ($ListOnly)           { throw '-Replace cannot be combined with -ListOnly.' }
+        if (-not (Test-IsAdmin)) { throw '-Replace needs an elevated PowerShell (Run as administrator).' }
+        if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+            throw '-Replace must be run from 64-bit PowerShell on 64-bit Windows (not the x86 shell).'
+        }
     }
 
     if (-not $OutputDir) {
@@ -681,6 +832,7 @@ try {
             SymbolServer = ''; SymbolServerUrl = ''; UnverifiedPath = ''; WindowsReleases = ''
             LocalStatus = ''; LocalVersion = ''; LocalSha256 = ''; LocalSize = ''
             LocalModifiedUtc = ''; LocalOwner = ''; LocalSignature = ''
+            Replacement = ''; BackupPath = ''
             ExpectedHashesThisBuild = @(); Error = ''
         }
 
@@ -779,6 +931,32 @@ try {
                     }
                 }
 
+                # (a2) a copy supplied from a trusted source - accepted only if Winbindex vouches for its hash
+                if (-not $pick -and $SourceDir) {
+                    $sp = Join-Path $SourceDir $name
+                    if (-not (Test-Path -LiteralPath $sp -PathType Leaf)) {
+                        Write-Log "No $name in -SourceDir '$SourceDir'." 'WARN'
+                    } else {
+                        $sh  = (Get-FileHash -LiteralPath $sp -Algorithm SHA256).Hash.ToLowerInvariant()
+                        Write-Log "Checking $sp (SHA-256 $sh) against Winbindex..."
+                        if (-not $index.ContainsKey($sh)) {
+                            Write-Log "Rejected: the SHA-256 of $sp is NOT in Winbindex, so it is not a known Microsoft file." 'ERROR'
+                        } else {
+                            $sfi  = Get-Val $index[$sh] 'fileInfo'
+                            $smt  = Get-Val $sfi 'machineType'
+                            $sver = [string](Get-Val $sfi 'version')
+                            if ($null -ne $smt -and [int]$smt -eq $os.MachineType -and
+                                ($sver -match '^(\d+)\.(\d+)\.(\d+)\.(\d+)') -and
+                                [int]$Matches[3] -eq $os.Build -and [int]$Matches[4] -le $os.Ubr) {
+                                $pick = [pscustomobject]@{ Path = $sp; Sha256 = $sh; Version = $sver; Where = 'SourceDir (hash-verified)' }
+                                Write-Log "Accepted: genuine Microsoft $name, version $sver." 'OK'
+                            } else {
+                                Write-Log "Rejected: $sp is a genuine Microsoft file (version $sver) but not for this build/architecture, or newer than this OS's update level." 'ERROR'
+                            }
+                        }
+                    }
+                }
+
                 if ($pick) {
                     Copy-Item -LiteralPath $pick.Path -Destination $destFile -Force
                     $copyHash = (Get-FileHash -LiteralPath $destFile -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -843,6 +1021,46 @@ try {
                     $exitCode = 1
                     Write-Log "Result: no verified copy of $name could be obtained." 'ERROR'
                 }
+
+                # ---- optional: replace the installed file ----
+                if ($Replace) {
+                    $needs = $false
+                    if ($res.LocalStatus -eq 'Identical') {
+                        $res.Replacement = 'Not needed (already genuine)'
+                        Write-Log "Installed $name is already genuine; nothing to replace." 'OK'
+                    } elseif ($res.LocalStatus -like 'GenuineOtherVersion*' -and -not $ReplaceGenuineOtherVersion) {
+                        $res.Replacement = 'Skipped (genuine, other version; use -ReplaceGenuineOtherVersion)'
+                        Write-Log "Installed $name is genuine Microsoft code of another version; leaving it. Use -ReplaceGenuineOtherVersion to replace it anyway." 'WARN'
+                    } else {
+                        $needs = $true
+                    }
+
+                    if ($needs -and -not $verifiedPath) {
+                        $res.Replacement = 'NOT replaced: no hash-verified source available'
+                        Write-Log "Cannot replace $name: no hash-verified copy is available, and unverified files are never installed. Provide one with -SourceDir (from a clean machine or the install media)." 'ERROR'
+                        $exitCode = 1
+                    } elseif ($needs) {
+                        $target = Join-Path $script:SysDir $name
+                        $action = "Replace with hash-verified $name $($res.ProvidedVersion) (SHA-256 $($res.ProvidedSha256)); original is backed up first"
+                        if ($PSCmdlet.ShouldProcess($target, $action)) {
+                            try {
+                                $ins = Install-VerifiedFile -Source $verifiedPath -Target $target `
+                                    -ExpectedSha256 $res.ProvidedSha256 -QuarantineDir (Join-Path $destDir 'quarantine')
+                                $res.Replacement = 'Replaced'
+                                $res.BackupPath  = $ins.BackupPath
+                                Write-Log "REPLACED $target with verified $name (signature: $($ins.Signature))." 'OK'
+                                if ($ins.BackupPath) { Write-Log "Original saved as evidence: $($ins.BackupPath) (do not run it)." 'INFO' }
+                                foreach ($n in $ins.Notes) { Write-Log $n 'WARN' }
+                            } catch {
+                                $res.Replacement = 'FAILED: ' + $_.Exception.Message
+                                Write-Log "Replacement of $name failed: $($_.Exception.Message)" 'ERROR'
+                                $exitCode = 1
+                            }
+                        } else {
+                            $res.Replacement = 'Not performed (declined / -WhatIf)'
+                        }
+                    }
+                }
             }
         } catch {
             $res.Status = 'Failed'
@@ -865,8 +1083,12 @@ try {
     # ---- report ----
     Write-Host ''
     Write-Log '==== Summary ====' 'OK'
-    $results | Select-Object File, Status, Source, ExpectedVersion, LocalStatus |
-        Format-Table -AutoSize | Out-String -Width 220 | Write-Host
+    $results | Select-Object File, Status, Source, ExpectedVersion, LocalStatus, Replacement |
+        Format-Table -AutoSize | Out-String -Width 260 | Write-Host
+
+    if (@($results | Where-Object { $_.Replacement -eq 'Replaced' }).Count -gt 0) {
+        Write-Log 'Next steps: run "sfc /verifyonly" and "DISM /Online /Cleanup-Image /ScanHealth" to confirm the system is consistent, and investigate how the originals were replaced (see the quarantine folder; do not execute those files).' 'WARN'
+    }
 
     if (-not $ListOnly) {
         $manifest = [pscustomobject]@{
