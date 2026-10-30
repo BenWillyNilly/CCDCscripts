@@ -1,42 +1,44 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Detects the running Windows build, finds the matching sfc.exe and dism.exe in
-    Winbindex (winbindex.m417z.com), downloads known-good copies from Microsoft's
-    public symbol server, and verifies them.
+    Detects the running Windows build, looks up the matching sfc.exe / dism.exe in
+    Winbindex (winbindex.m417z.com), obtains HASH-VERIFIED known-good copies, and
+    checks the copies installed on this machine against them.
 
 .DESCRIPTION
-    1. Detects Windows version/build/UBR/architecture (registry + ntdll cross-check).
-    2. Downloads the Winbindex index for each requested file
-       (https://winbindex.m417z.com/data/by_filename_compressed/<file>.json.gz).
-    3. Picks the entry that matches this OS build + UBR + CPU architecture:
+    1. Detects Windows version / build / UBR / architecture.
+    2. Downloads the Winbindex index for each file and selects the entry matching
+       this build + architecture:
          Exact         - file version == <build>.<UBR> of the running OS
-         NearestLower  - highest version for this build that is <= your UBR
-                         (Windows only bumps a file's version when it changes)
-         NearestHigher - last resort, only with -MatchMode Nearest
-    4. Downloads the binary from msdl.microsoft.com using the PE TimeDateStamp +
-       SizeOfImage key from the index, with retries.
-    5. Verifies the download: SHA-256 equals the index key, file size, PE header,
-       CPU architecture. Authenticode status is reported for information.
-    6. Compares the copy installed in System32 against the known-good copy and
-       against the whole Winbindex index (a hash Winbindex has never seen is a red
-       flag for a replaced/modified file - or an update newer than the index).
-    7. Writes manifest.json and SHA256SUMS.txt next to the downloads.
+         NearestLower  - newest version at or below your UBR (Windows only bumps a
+                         file's version when that file changes - this is normal)
+         NearestHigher - last resort (only with -MatchMode Nearest)
+    3. Examines the installed file in System32: SHA-256, version, size, timestamps,
+       owner, signature - and compares the hash with the whole Winbindex index.
+       Also flags files that are byte-for-byte identical to EACH OTHER.
+    4. Obtains a known-good copy, in this order:
+         a) the local component store (WinSxS): any copy whose SHA-256 appears in
+            Winbindex for this build/architecture is genuine Microsoft code;
+         b) Microsoft's symbol server (msdl.microsoft.com), using the key from
+            the index.
+       IMPORTANT: the symbol server sometimes serves a different (development /
+       unsigned) variant under the same key, so a symbol-server file is only
+       accepted as known-good if its SHA-256 equals the Winbindex hash. Files
+       that don't match are saved under "unverified\" and clearly labelled.
+    5. Writes manifest.json, SHA256SUMS.txt (verified files only) and
+       expected-hashes.csv (every genuine hash Winbindex has for this build, so
+       you can check any candidate file on a trusted machine).
 
-    Nothing is ever written to System32. The downloaded files are for comparison,
-    hashing and offline analysis.
+    Nothing is ever written to System32.
 
 .PARAMETER Files
-    Files to look up. Default: sfc.exe, dism.exe. Add more (e.g. sfc_os.dll,
-    dismapi.dll, dismcore.dll) if you want them too.
+    Files to look up. Default: sfc.exe, dism.exe.
 
 .PARAMETER OutputDir
-    Base download folder. Default: .\KnownGood (files go in a subfolder named
-    <build>.<ubr>-<arch>).
+    Base output folder. Default: .\KnownGood (results go in <build>.<ubr>-<arch>).
 
 .PARAMETER TargetVersion
-    Override the detected version, e.g. "26100.7920" or "10.0.26100.7920"
-    (useful for fetching files for a different machine).
+    Override the detected version, e.g. "17763.3650" or "10.0.17763.3650".
 
 .PARAMETER Architecture
     Auto (default), x64, x86 or arm64.
@@ -45,19 +47,25 @@
     Nearest (default) or ExactOnly.
 
 .PARAMETER ListOnly
-    Show which files would be downloaded, but download nothing.
+    Analyse and compare only; download/copy nothing.
+
+.PARAMETER SkipLocalSearch
+    Don't search WinSxS for genuine copies.
+
+.PARAMETER SkipDownload
+    Don't contact the symbol server.
 
 .PARAMETER Force
-    Re-download even if a verified copy is already present.
+    Re-obtain files even if a verified copy is already present.
 
 .PARAMETER NoCache / CacheHours
-    Control caching of the Winbindex index files (default 24 h).
+    Control caching of the Winbindex index (default 24 h).
 
 .PARAMETER Proxy
-    Optional proxy URL. Default system proxy settings are used otherwise.
+    Optional proxy URL.
 
 .PARAMETER LogPath
-    Optional path of a log file.
+    Optional log file path.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Get-KnownGoodSfcDism.ps1
@@ -66,15 +74,12 @@
     .\Get-KnownGoodSfcDism.ps1 -ListOnly
 
 .EXAMPLE
-    .\Get-KnownGoodSfcDism.ps1 -Files sfc.exe,dism.exe,sfc_os.dll,dismapi.dll,dismcore.dll -OutputDir C:\Evidence
-
-.EXAMPLE
-    .\Get-KnownGoodSfcDism.ps1 -TargetVersion 10.0.22621.3007 -Architecture x64
+    .\Get-KnownGoodSfcDism.ps1 -Files sfc.exe,dism.exe,sfc_os.dll,dismapi.dll,dismcore.dll
 
 .NOTES
-    Exit codes: 0 = everything succeeded, 1 = at least one file failed, 2 = fatal error.
-    Works on Windows PowerShell 5.1 and PowerShell 7+. Needs internet access to
-    winbindex.m417z.com and msdl.microsoft.com (HTTPS). Admin rights not required.
+    Exit codes: 0 = a verified copy was obtained for every file, 1 = at least one
+    file has no verified copy, 2 = fatal error. Admin rights recommended (WinSxS,
+    ownership info). Works on Windows PowerShell 5.1 and PowerShell 7+.
 #>
 [CmdletBinding()]
 param(
@@ -95,12 +100,14 @@ param(
     [switch]$NoCache,
     [switch]$Force,
     [switch]$ListOnly,
+    [switch]$SkipLocalSearch,
+    [switch]$SkipDownload,
     [string]$LogPath
 )
 
 $script:IndexBase    = 'https://winbindex.m417z.com/data/by_filename_compressed'
 $script:SymbolBase   = 'https://msdl.microsoft.com/download/symbols'
-$script:UserAgent    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) KnownGoodFetcher/1.0'
+$script:UserAgent    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) KnownGoodFetcher/2.0'
 $script:MachineTypes = @{ 'x64' = 0x8664; 'x86' = 0x014C; 'arm64' = 0xAA64 }
 $script:LogFile      = $null
 $script:SysDir       = $null
@@ -131,7 +138,7 @@ function Write-Log {
 }
 
 function Get-Val {
-    # Safe lookup that works for dictionaries (Hashtable / Dictionary<string,object>) and PSCustomObjects.
+    # Safe lookup for dictionaries (Hashtable / Dictionary<string,object>) and PSCustomObjects.
     param($Dict, [string]$Key)
     if ($null -eq $Dict) { return $null }
     if ($Dict -is [System.Collections.IDictionary]) {
@@ -211,6 +218,17 @@ function ConvertFrom-JsonLarge {
     return $ser.DeserializeObject($Json)
 }
 
+function Get-SignatureInfo {
+    param([Parameter(Mandatory)][string]$Path)
+    $o = [pscustomobject]@{ Status = 'Unavailable'; Signer = '' }
+    try {
+        $s = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        $o.Status = $s.Status.ToString()
+        if ($s.SignerCertificate) { $o.Signer = $s.SignerCertificate.Subject }
+    } catch { }
+    return $o
+}
+
 # =============================================================================
 # OS detection
 # =============================================================================
@@ -218,7 +236,6 @@ function ConvertFrom-JsonLarge {
 function Get-OsInfo {
     $cv = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
 
-    # --- architecture ---
     $arch = $Architecture
     if ($arch -eq 'Auto') {
         $raw = $env:PROCESSOR_ARCHITEW6432          # set when a 32-bit process runs on a 64-bit OS
@@ -231,7 +248,6 @@ function Get-OsInfo {
         }
     }
 
-    # --- version ---
     $major = 10; $minor = 0
     if ($cv.PSObject.Properties['CurrentMajorVersionNumber']) {
         $major = [int]$cv.CurrentMajorVersionNumber
@@ -254,7 +270,6 @@ function Get-OsInfo {
     $installType = ''
     if ($cv.PSObject.Properties['InstallationType']) { $installType = [string]$cv.InstallationType }
 
-    # --- cross-check against the on-disk ntdll.dll (differs while a reboot is pending) ---
     $diskVersion = $null
     $ntdll = Join-Path $script:SysDir 'ntdll.dll'
     if (Test-Path -LiteralPath $ntdll) {
@@ -265,7 +280,7 @@ function Get-OsInfo {
     $isOverride = $false
     if ($TargetVersion) {
         if (-not ($TargetVersion.Trim() -match '^(?:(\d+)\.(\d+)\.)?(\d+)\.(\d+)$')) {
-            throw "-TargetVersion '$TargetVersion' is not valid. Use e.g. 26100.7920 or 10.0.26100.7920."
+            throw "-TargetVersion '$TargetVersion' is not valid. Use e.g. 17763.3650 or 10.0.17763.3650."
         }
         if ($Matches[1]) { $major = [int]$Matches[1]; $minor = [int]$Matches[2] }
         $build = [int]$Matches[3]; $ubr = [int]$Matches[4]
@@ -338,8 +353,10 @@ function Get-WinbindexIndex {
 function Select-BestEntry {
     param($Index, [int]$MachineType, [int]$OsBuild, [int]$OsUbr)
 
-    $cands        = New-Object System.Collections.Generic.List[object]
-    $forBuild     = 0
+    $cands    = New-Object System.Collections.Generic.List[object]
+    $allBuild = New-Object System.Collections.Generic.List[object]
+    $forBuild = 0
+
     foreach ($sha in $Index.Keys) {
         $entry = $Index[$sha]
         $fi = Get-Val $entry 'fileInfo'
@@ -354,12 +371,15 @@ function Select-BestEntry {
         $ubr = [int]$Matches[4]
         $forBuild++
 
+        $shaLower = ([string]$sha).ToLowerInvariant()
+        $allBuild.Add([pscustomobject]@{ Version = $ver; Ubr = $ubr; Sha256 = $shaLower })
+
         $ts = Get-Val $fi 'timestamp'
         $vs = Get-Val $fi 'virtualSize'
         if ($null -eq $ts -or $null -eq $vs) { continue }      # no symbol-server key => cannot download
 
         $cands.Add([pscustomobject]@{
-            Sha256      = ([string]$sha).ToLowerInvariant()
+            Sha256      = $shaLower
             Version     = $ver
             Ubr         = $ubr
             Timestamp   = [uint32]$ts
@@ -370,7 +390,11 @@ function Select-BestEntry {
         })
     }
 
-    $result = [pscustomobject]@{ Selected = $null; Tier = $null; Alternates = 0; ForBuild = $forBuild; Downloadable = $cands.Count; Reason = $null }
+    $result = [pscustomobject]@{
+        Selected = $null; Tier = $null; Alternates = 0
+        ForBuild = $forBuild; Downloadable = $cands.Count; Reason = $null
+        Hashes   = @($allBuild | Sort-Object -Property Ubr)
+    }
 
     if ($forBuild -eq 0) {
         $result.Reason = "Winbindex has no entry for build $OsBuild on this architecture."
@@ -411,20 +435,73 @@ function Select-BestEntry {
 }
 
 # =============================================================================
-# Local file + verification
+# Local files
 # =============================================================================
 
 function Get-LocalFileInfo {
     param([Parameter(Mandatory)][string]$Name)
     $p = Join-Path $script:SysDir $Name
     if (-not (Test-Path -LiteralPath $p)) { return $null }
-    $vi = (Get-Item -LiteralPath $p).VersionInfo
+
+    $item = Get-Item -LiteralPath $p -Force
+    $vi   = $item.VersionInfo
+    $ver  = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart
+
+    $owner = ''
+    try { $owner = (Get-Acl -LiteralPath $p -ErrorAction Stop).Owner } catch { }
+    $sig = Get-SignatureInfo -Path $p
+
     [pscustomobject]@{
-        Path    = $p
-        Sha256  = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
-        Version = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart
+        Path          = $p
+        Sha256        = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
+        Version       = $ver
+        NoVersionInfo = ((-not $vi.FileVersion) -or $ver -eq '0.0.0.0')
+        Size          = $item.Length
+        CreatedUtc    = $item.CreationTimeUtc.ToString('yyyy-MM-dd HH:mm:ss')
+        ModifiedUtc   = $item.LastWriteTimeUtc.ToString('yyyy-MM-dd HH:mm:ss')
+        Owner         = $owner
+        Signature     = $sig.Status
+        Signer        = $sig.Signer
     }
 }
+
+function Find-GenuineLocalCopies {
+    # Searches the component store for copies of $Name whose SHA-256 appears in the
+    # Winbindex index for this CPU architecture. Such a copy is genuine Microsoft code.
+    param([Parameter(Mandatory)][string]$Name, $Index, [int]$MachineType)
+
+    $root  = Join-Path $env:windir 'WinSxS'
+    $found = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path -LiteralPath $root)) { return ,@() }
+
+    $seen  = @{}
+    $items = Get-ChildItem -LiteralPath $root -Recurse -Filter $Name -File -Force -ErrorAction SilentlyContinue
+    foreach ($f in $items) {
+        $h = $null
+        try { $h = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop).Hash } catch { continue }
+        if (-not $h) { continue }
+        $h = $h.ToLowerInvariant()
+        if ($seen.ContainsKey($h)) { continue }
+        $seen[$h] = $true
+        if (-not $Index.ContainsKey($h)) { continue }
+
+        $fi = Get-Val $Index[$h] 'fileInfo'
+        $mt = Get-Val $fi 'machineType'
+        if ($null -eq $mt -or [int]$mt -ne $MachineType) { continue }
+        $ver = [string](Get-Val $fi 'version')
+        if (-not ($ver -match '^(\d+)\.(\d+)\.(\d+)\.(\d+)')) { continue }
+
+        $found.Add([pscustomobject]@{
+            Path = $f.FullName; Sha256 = $h; Version = $ver
+            Build = [int]$Matches[3]; Ubr = [int]$Matches[4]
+        })
+    }
+    return ,@($found)
+}
+
+# =============================================================================
+# Verification + download
+# =============================================================================
 
 function Test-DownloadedFile {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Sel)
@@ -436,12 +513,12 @@ function Test-DownloadedFile {
 
     $r.Sha256   = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
     $r.Sha256Ok = ($r.Sha256 -eq $Sel.Sha256)
-    if (-not $r.Sha256Ok) { $r.Problems += "SHA-256 mismatch (got $($r.Sha256), expected $($Sel.Sha256))" }
+    if (-not $r.Sha256Ok) { $r.Problems += "SHA-256 differs from the Winbindex hash (got $($r.Sha256), index says $($Sel.Sha256))" }
 
     if ($null -ne $Sel.Size) {
         $len = (Get-Item -LiteralPath $Path).Length
         $r.SizeOk = ($len -eq [int64]$Sel.Size)
-        if (-not $r.SizeOk) { $r.Problems += "Size mismatch ($len vs $($Sel.Size))" }
+        if (-not $r.SizeOk) { $r.Problems += "Size differs ($len bytes vs $($Sel.Size) in the index)" }
     }
 
     $fs = $null; $br = $null
@@ -464,51 +541,40 @@ function Test-DownloadedFile {
         if ($br) { $br.Close() }
         if ($fs) { $fs.Dispose() }
     }
-    if (-not $r.PeOk)      { $r.Problems += 'Not a valid PE file' }
+    if (-not $r.PeOk)          { $r.Problems += 'Not a valid PE file' }
     elseif (-not $r.MachineOk) { $r.Problems += 'PE machine type does not match the requested architecture' }
 
     $r.Passed = ($r.Sha256Ok -and $r.PeOk -and $r.MachineOk -and ($r.SizeOk -ne $false))
     return [pscustomobject]$r
 }
 
-function Get-SignatureInfo {
-    param([Parameter(Mandatory)][string]$Path)
-    $o = [pscustomobject]@{ Status = 'Unavailable'; Signer = '' }
-    try {
-        $s = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
-        $o.Status = $s.Status.ToString()
-        if ($s.SignerCertificate) { $o.Signer = $s.SignerCertificate.Subject }
-    } catch { }
-    return $o
-}
-
 function Save-KnownGoodFile {
+    # Downloads from the symbol server. Returns Verified=$true only if the SHA-256
+    # equals the Winbindex hash; otherwise the file is parked in .\unverified.
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)]$Sel, [Parameter(Mandatory)][string]$DestDir)
 
     $dest = Join-Path $DestDir $Name
-    $out  = [ordered]@{ Path = $dest; Url = ''; Reused = $false; Verification = $null }
-
-    if ((Test-Path -LiteralPath $dest) -and -not $Force) {
-        $h = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($h -eq $Sel.Sha256) {
-            Write-Log "$Name already present and hash-verified; skipping download (use -Force to re-download)." 'OK'
-            $out.Reused       = $true
-            $out.Verification = Test-DownloadedFile -Path $dest -Sel $Sel
-            return [pscustomobject]$out
-        }
-        Write-Log "$Name exists but its hash does not match the expected file; re-downloading." 'WARN'
+    $out  = [ordered]@{
+        Path = $dest; Url = ''; Verified = $false; Reused = $false
+        Verification = $null; DownloadedVersion = ''; DownloadedSha256 = ''
     }
 
-    # Symbol-server key = TimeDateStamp (8 uppercase hex) + SizeOfImage (hex). Winbindex uses
-    # lowercase for the size; try uppercase as a fallback in case the server is case-sensitive.
+    if ((Test-Path -LiteralPath $dest) -and -not $Force) {
+        $existing = Test-DownloadedFile -Path $dest -Sel $Sel
+        if ($existing.Passed) {
+            $out.Verified = $true; $out.Reused = $true; $out.Verification = $existing
+            return [pscustomobject]$out
+        }
+    }
+
+    # Symbol-server key = TimeDateStamp (8 uppercase hex) + SizeOfImage (hex; Winbindex uses lowercase).
     $k1   = '{0:X8}{1:x}' -f $Sel.Timestamp, $Sel.VirtualSize
     $k2   = '{0:X8}{1:X}' -f $Sel.Timestamp, $Sel.VirtualSize
     $keys = @($k1)
     if ($k2 -cne $k1) { $keys += $k2 }
 
-    $part    = "$dest.part"
-    $ok      = $false
-    $lastErr = $null
+    $part = "$dest.part"
+    $ok = $false; $lastErr = $null
     foreach ($k in $keys) {
         $url = "$($script:SymbolBase)/$Name/$k/$Name"
         Write-Log "Downloading $url"
@@ -525,13 +591,28 @@ function Save-KnownGoodFile {
     if (-not $ok) { throw "Download failed from the symbol server: $lastErr" }
 
     $v = Test-DownloadedFile -Path $part -Sel $Sel
-    if (-not $v.Passed) {
+    $out.Verification     = $v
+    $out.DownloadedSha256 = $v.Sha256
+
+    if (-not $v.PeOk -or -not $v.MachineOk) {
         Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
-        throw ('Downloaded file failed verification and was deleted: ' + ($v.Problems -join '; '))
+        throw 'The server did not return a valid PE image for this architecture (possibly an error page or a proxy/interception page).'
     }
 
-    Move-Item -LiteralPath $part -Destination $dest -Force
-    $out.Verification = $v
+    if ($v.Passed) {
+        Move-Item -LiteralPath $part -Destination $dest -Force
+        $out.Verified = $true
+        return [pscustomobject]$out
+    }
+
+    # Different variant served: keep it, but quarantine it under "unverified".
+    $uDir = Join-Path $DestDir 'unverified'
+    New-Item -ItemType Directory -Path $uDir -Force | Out-Null
+    $uDest = Join-Path $uDir $Name
+    Move-Item -LiteralPath $part -Destination $uDest -Force
+    $vi = (Get-Item -LiteralPath $uDest).VersionInfo
+    $out.Path = $uDest
+    $out.DownloadedVersion = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart
     return [pscustomobject]$out
 }
 
@@ -553,7 +634,7 @@ try {
 
     Initialize-Network
 
-    # System directory (use Sysnative if running 32-bit PowerShell on 64-bit Windows so we see the real files)
+    # Use Sysnative if running 32-bit PowerShell on 64-bit Windows so we see the real System32.
     $script:SysDir = Join-Path $env:windir 'System32'
     if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
         $script:SysDir = Join-Path $env:windir 'Sysnative'
@@ -572,8 +653,13 @@ try {
     $os = Get-OsInfo
     Write-Log ('OS            : {0} {1} ({2}{3})' -f $os.ProductName, $os.DisplayVersion, $os.Edition, $(if ($os.InstallType) { ', ' + $os.InstallType } else { '' }))
     Write-Log ('Version       : {0}   Architecture: {1}{2}' -f $os.FullVersion, $os.Architecture, $(if ($os.IsOverride) { '   (overridden by -TargetVersion)' } else { '' }))
-    if (-not $os.IsOverride -and $os.DiskVersion -and $os.DiskVersion -ne $os.FullVersion) {
-        Write-Log "ntdll.dll on disk is $($os.DiskVersion) but the registry reports $($os.FullVersion). A reboot may be pending after an update; matches may differ from what is on disk." 'WARN'
+
+    # A file on disk being OLDER than the OS update level is normal (files only change in some updates).
+    # A file that is NEWER than the registry's update level suggests an update awaiting reboot.
+    if (-not $os.IsOverride -and $os.DiskVersion -match '^\d+\.\d+\.(\d+)\.(\d+)$') {
+        if ([int]$Matches[1] -eq $os.Build -and [int]$Matches[2] -gt $os.Ubr) {
+            Write-Log "ntdll.dll on disk ($($os.DiskVersion)) is newer than the running update level ($($os.FullVersion)); an update is probably awaiting a reboot." 'WARN'
+        }
     }
     if ($os.Major -lt 10) {
         Write-Log 'Winbindex only indexes Windows 10 / Server 2016 and later; expect no matches on this OS.' 'WARN'
@@ -582,15 +668,20 @@ try {
     $destDir = Join-Path $OutputDir ('{0}.{1}-{2}' -f $os.Build, $os.Ubr, $os.Architecture)
     if (-not $ListOnly) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
 
-    # ---- 2..6. per file ----
-    $results = New-Object System.Collections.Generic.List[object]
+    # ---- 2..5. per file ----
+    $results   = New-Object System.Collections.Generic.List[object]
+    $allowRows = New-Object System.Collections.Generic.List[object]
 
     foreach ($file in $Files) {
         $name = ([string]$file).Trim().ToLowerInvariant()
         $res  = [ordered]@{
-            File = $name; Status = 'Failed'; MatchTier = ''; Version = ''; Sha256 = ''; Url = ''; Path = ''
-            WindowsReleases = ''; LocalStatus = ''; LocalVersion = ''; LocalSha256 = ''
-            Signature = ''; Signer = ''; Error = ''
+            File = $name; Status = 'Failed'; Source = ''; Path = ''
+            ExpectedVersion = ''; ExpectedSha256 = ''; MatchTier = ''
+            ProvidedVersion = ''; ProvidedSha256 = ''
+            SymbolServer = ''; SymbolServerUrl = ''; UnverifiedPath = ''; WindowsReleases = ''
+            LocalStatus = ''; LocalVersion = ''; LocalSha256 = ''; LocalSize = ''
+            LocalModifiedUtc = ''; LocalOwner = ''; LocalSignature = ''
+            ExpectedHashesThisBuild = @(); Error = ''
         }
 
         try {
@@ -601,59 +692,157 @@ try {
             Write-Log ("Index contains {0} indexed file versions." -f $index.Count) 'DEBUG'
 
             $sel = Select-BestEntry -Index $index -MachineType $os.MachineType -OsBuild $os.Build -OsUbr $os.Ubr
+            $res.ExpectedHashesThisBuild = @($sel.Hashes)
+            foreach ($h in $sel.Hashes) {
+                $allowRows.Add([pscustomobject]@{ File = $name; Version = $h.Version; Sha256 = $h.Sha256 })
+            }
             if (-not $sel.Selected) { throw $sel.Reason }
 
             $best = $sel.Selected
-            $res.MatchTier = $sel.Tier
-            $res.Version   = $best.Version
-            $res.Sha256    = $best.Sha256
+            $res.MatchTier       = $sel.Tier
+            $res.ExpectedVersion = $best.Version
+            $res.ExpectedSha256  = $best.Sha256
 
             $rels = Get-Val $best.Entry 'windowsVersions'
             if ($rels -is [System.Collections.IDictionary]) { $res.WindowsReleases = (@($rels.Keys) -join ', ') }
 
             switch ($sel.Tier) {
-                'Exact'         { Write-Log ("Matched {0} version {1} (exact match for OS {2}.{3})." -f $name, $best.Version, $os.Build, $os.Ubr) 'OK' }
-                'NearestLower'  { Write-Log ("No file version exactly {0}.{1}. Using {2}, the newest version at or below your update level (normal when the file did not change in recent updates)." -f $os.Build, $os.Ubr, $best.Version) 'WARN' }
+                'Exact'         { Write-Log ("Expected {0}: version {1} (exact match for OS {2}.{3})." -f $name, $best.Version, $os.Build, $os.Ubr) 'OK' }
+                'NearestLower'  { Write-Log ("No file version exactly {0}.{1}. Expecting {2}, the newest version at or below your update level (normal when a file did not change in recent updates)." -f $os.Build, $os.Ubr, $best.Version) 'WARN' }
                 'NearestHigher' { Write-Log ("No file version at or below {0}.{1}. Using the closest NEWER version {2}." -f $os.Build, $os.Ubr, $best.Version) 'WARN' }
             }
-            if ($sel.Alternates -gt 0) { Write-Log "$($sel.Alternates) other index entr$(if ($sel.Alternates -eq 1) {'y'} else {'ies'}) share this version; newest build timestamp chosen." 'DEBUG' }
-            if ($res.WindowsReleases) { Write-Log "Winbindex lists this file in: $($res.WindowsReleases)" 'DEBUG' }
-            Write-Log "SHA-256 expected: $($best.Sha256)"
+            Write-Log "Expected SHA-256: $($best.Sha256)"
+            Write-Log ("Winbindex knows {0} genuine variant(s) of {1} for build {2} ({3})." -f $sel.Hashes.Count, $name, $os.Build, $os.Architecture) 'DEBUG'
 
-            # ---- local comparison ----
+            # ---- examine the installed copy ----
             $local = Get-LocalFileInfo -Name $name
             if (-not $local) {
                 $res.LocalStatus = 'NotFoundInSystem'
                 Write-Log "$name not found in $($script:SysDir)." 'WARN'
             } else {
-                $res.LocalVersion = $local.Version
-                $res.LocalSha256  = $local.Sha256
+                $res.LocalVersion = $local.Version; $res.LocalSha256 = $local.Sha256
+                $res.LocalSize = $local.Size; $res.LocalModifiedUtc = $local.ModifiedUtc
+                $res.LocalOwner = $local.Owner; $res.LocalSignature = $local.Signature
+
+                Write-Log ("Installed copy: {0} bytes, version {1}, modified {2} UTC, owner {3}, signature {4}" -f `
+                    $local.Size, $local.Version, $local.ModifiedUtc, $local.Owner, $local.Signature)
+                Write-Log "Installed SHA-256: $($local.Sha256)"
+
+                if ($local.NoVersionInfo) {
+                    Write-Log "Installed $name has NO version resource (reports 0.0.0.0). Genuine Microsoft system binaries always carry one." 'ERROR'
+                }
+                if ($local.Owner -and $local.Owner -notmatch 'TrustedInstaller') {
+                    Write-Log "Owner is '$($local.Owner)'; genuine system files are normally owned by NT SERVICE\TrustedInstaller." 'WARN'
+                }
+                if ($local.Signature -ne 'Valid') {
+                    Write-Log "Signature status is '$($local.Signature)' (a genuine, unmodified Windows binary normally validates as 'Valid')." 'WARN'
+                }
+
                 if ($local.Sha256 -eq $best.Sha256) {
                     $res.LocalStatus = 'Identical'
-                    Write-Log "Installed $name is IDENTICAL to Microsoft's copy." 'OK'
+                    Write-Log "Installed $name is IDENTICAL to the expected Microsoft file." 'OK'
                 } elseif ($index.ContainsKey($local.Sha256)) {
                     $lv = Get-Val (Get-Val $index[$local.Sha256] 'fileInfo') 'version'
                     $res.LocalStatus = "GenuineOtherVersion ($lv)"
-                    Write-Log "Installed $name is a genuine Microsoft file but a different version ($lv) than expected ($($best.Version)). Could be a pending update, or an old file swapped in." 'WARN'
+                    Write-Log "Installed $name is a genuine Microsoft file, but version $lv rather than the expected $($best.Version)." 'WARN'
                 } else {
                     $res.LocalStatus = 'UnknownToWinbindex'
-                    Write-Log "Installed $name (SHA-256 $($local.Sha256), version $($local.Version)) is NOT in Winbindex. It may be modified/replaced - or an update newer than the index. Investigate." 'ERROR'
+                    Write-Log "Installed $name is NOT in Winbindex (it may be modified/replaced, or an update newer than the index)." 'ERROR'
                 }
             }
 
-            # ---- download ----
+            # ---- obtain a verified known-good copy ----
             if ($ListOnly) {
                 $res.Status = 'Matched (not downloaded)'
             } else {
-                $saved = Save-KnownGoodFile -Name $name -Sel $best -DestDir $destDir
-                $res.Path = $saved.Path
-                $res.Url  = $saved.Url
-                $sig = Get-SignatureInfo -Path $saved.Path
-                $res.Signature = $sig.Status
-                $res.Signer    = $sig.Signer
-                $res.Status    = if ($saved.Reused) { 'OK (already present)' } else { 'OK' }
-                Write-Log "Verified: SHA-256, size and PE header match. Saved to $($saved.Path)" 'OK'
-                Write-Log ("Authenticode: {0}{1}" -f $sig.Status, $(if ($sig.Status -eq 'NotSigned') { ' (normal for catalog-signed Windows binaries; the SHA-256 match above is the authoritative check)' } else { '' })) 'DEBUG'
+                $verifiedPath = $null
+                $destFile = Join-Path $destDir $name
+
+                # (a) a copy we already trust: the installed file if identical, else a genuine copy in WinSxS
+                $pick = $null
+                if ($local -and $res.LocalStatus -eq 'Identical') {
+                    $pick = [pscustomobject]@{ Path = $local.Path; Sha256 = $local.Sha256; Version = $best.Version; Where = 'System32 (hash-verified)' }
+                } elseif (-not $SkipLocalSearch -and -not $os.IsOverride) {
+                    Write-Log 'Searching the component store (WinSxS) for genuine copies - this can take a minute...'
+                    $found = @(Find-GenuineLocalCopies -Name $name -Index $index -MachineType $os.MachineType)
+                    Write-Log ("Found {0} genuine copy/copies of {1} in WinSxS." -f $found.Count, $name) 'DEBUG'
+                    $cand = @($found | Where-Object { $_.Build -eq $os.Build })
+                    $p1 = $cand | Where-Object { $_.Sha256 -eq $best.Sha256 } | Select-Object -First 1
+                    if (-not $p1) {
+                        $lowers = @($cand | Where-Object { $_.Ubr -le $os.Ubr })
+                        if ($lowers.Count -gt 0) { $p1 = $lowers | Sort-Object -Property Ubr -Descending | Select-Object -First 1 }
+                    }
+                    if ($p1) {
+                        $pick = [pscustomobject]@{ Path = $p1.Path; Sha256 = $p1.Sha256; Version = $p1.Version; Where = 'WinSxS (hash-verified)' }
+                    } else {
+                        Write-Log "No genuine copy of $name found in WinSxS." 'WARN'
+                    }
+                }
+
+                if ($pick) {
+                    Copy-Item -LiteralPath $pick.Path -Destination $destFile -Force
+                    $copyHash = (Get-FileHash -LiteralPath $destFile -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($copyHash -eq $pick.Sha256) {
+                        $verifiedPath = $destFile
+                        $res.Source = $pick.Where
+                        $res.ProvidedVersion = $pick.Version
+                        $res.ProvidedSha256  = $pick.Sha256
+                        if ($pick.Sha256 -eq $best.Sha256) {
+                            Write-Log "Verified known-good $name copied from $($pick.Path)" 'OK'
+                        } else {
+                            Write-Log "Verified genuine $name (version $($pick.Version)) copied from $($pick.Path); it is not the exact expected version but is real Microsoft code for this build." 'WARN'
+                        }
+                    } else {
+                        Remove-Item -LiteralPath $destFile -Force -ErrorAction SilentlyContinue
+                        Write-Log "Copy of $($pick.Path) failed hash re-check; discarded." 'WARN'
+                    }
+                }
+
+                # (b) symbol server
+                if (-not $SkipDownload) {
+                    try {
+                        $saved = Save-KnownGoodFile -Name $name -Sel $best -DestDir $destDir
+                        $res.SymbolServerUrl = $saved.Url
+                        if ($saved.Reused) {
+                            $res.SymbolServer = 'Skipped (verified copy already present)'
+                        } elseif ($saved.Verified) {
+                            $res.SymbolServer = 'Verified (hash matches Winbindex)'
+                            Write-Log "Symbol-server download of $name matches the Winbindex hash." 'OK'
+                            if (-not $verifiedPath) {
+                                $verifiedPath = $saved.Path
+                                $res.Source = 'Symbol server (hash-verified)'
+                                $res.ProvidedVersion = $best.Version
+                                $res.ProvidedSha256  = $best.Sha256
+                            }
+                        } else {
+                            $res.SymbolServer  = 'UNVERIFIED variant (hash differs from Winbindex)'
+                            $res.UnverifiedPath = $saved.Path
+                            Write-Log ("The symbol server returned a DIFFERENT variant of {0} (SHA-256 {1}, version {2}). Winbindex's author notes it sometimes serves unsigned development builds under the same key. Saved to '{3}' for reference only - do NOT treat it as known-good." -f `
+                                $name, $saved.DownloadedSha256, $saved.DownloadedVersion, $saved.Path) 'WARN'
+                            foreach ($pr in $saved.Verification.Problems) { Write-Log "  - $pr" 'DEBUG' }
+                        }
+                    } catch {
+                        $res.SymbolServer = 'Failed: ' + $_.Exception.Message
+                        Write-Log "Symbol server: $($_.Exception.Message)" 'WARN'
+                        if (-not $verifiedPath) { $res.Error = $_.Exception.Message }
+                    }
+                }
+
+                if ($verifiedPath) {
+                    $res.Status = 'OK'
+                    $res.Path   = $verifiedPath
+                    $res.Error  = ''
+                    Write-Log "Result: verified known-good $name -> $verifiedPath" 'OK'
+                } elseif ($res.UnverifiedPath) {
+                    $res.Status = 'Unverified'
+                    $res.Path   = $res.UnverifiedPath
+                    $exitCode = 1
+                    Write-Log "Result: only an UNVERIFIED $name is available. Get a genuine copy from a trusted machine or the install media and check its SHA-256 against expected-hashes.csv." 'ERROR'
+                } else {
+                    $res.Status = 'Failed'
+                    $exitCode = 1
+                    Write-Log "Result: no verified copy of $name could be obtained." 'ERROR'
+                }
             }
         } catch {
             $res.Status = 'Failed'
@@ -665,12 +854,19 @@ try {
         $results.Add([pscustomobject]$res)
     }
 
-    # ---- 7. report ----
+    # ---- cross-file checks ----
+    $dupes = @($results | Where-Object { $_.LocalSha256 } | Group-Object -Property LocalSha256 | Where-Object { $_.Count -gt 1 })
+    foreach ($g in $dupes) {
+        $names = ($g.Group | ForEach-Object { $_.File }) -join ' and '
+        Write-Log "Installed $names are BYTE-FOR-BYTE IDENTICAL (SHA-256 $($g.Name)). These are different programs and cannot legitimately be the same file - they have almost certainly been replaced." 'ERROR'
+        foreach ($r in $g.Group) { $r.LocalStatus = 'IDENTICAL-TO-OTHER-FILE; ' + $r.LocalStatus }
+    }
+
+    # ---- report ----
     Write-Host ''
     Write-Log '==== Summary ====' 'OK'
-    $results | Select-Object File, Status, MatchTier, Version,
-        @{ n = 'SHA256'; e = { if ($_.Sha256) { $_.Sha256.Substring(0, 16) + '...' } else { '' } } },
-        LocalStatus | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+    $results | Select-Object File, Status, Source, ExpectedVersion, LocalStatus |
+        Format-Table -AutoSize | Out-String -Width 220 | Write-Host
 
     if (-not $ListOnly) {
         $manifest = [pscustomobject]@{
@@ -683,16 +879,20 @@ try {
         $manifestPath = Join-Path $destDir 'manifest.json'
         $manifest | ConvertTo-Json -Depth 6 | Set-Content -Path $manifestPath -Encoding UTF8
 
-        $sums = foreach ($r in $results) { if ($r.Status -like 'OK*') { '{0} *{1}' -f $r.Sha256, $r.File } }
+        $sums = foreach ($r in $results) { if ($r.Status -eq 'OK') { '{0} *{1}' -f $r.ProvidedSha256, $r.File } }
         if ($sums) { Set-Content -Path (Join-Path $destDir 'SHA256SUMS.txt') -Value $sums -Encoding ASCII }
+
+        $csvPath = Join-Path $destDir 'expected-hashes.csv'
+        $allowRows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
         Write-Log "Output folder : $destDir"
         Write-Log "Manifest      : $manifestPath"
+        Write-Log "Genuine hashes: $csvPath (every Winbindex hash for this build - check candidate files against it)"
     }
 
-    $bad = @($results | Where-Object { $_.LocalStatus -eq 'UnknownToWinbindex' -or $_.LocalStatus -like 'GenuineOtherVersion*' })
+    $bad = @($results | Where-Object { $_.LocalStatus -and $_.LocalStatus -ne 'Identical' -and $_.LocalStatus -ne 'NotFoundInSystem' })
     if ($bad.Count -gt 0) {
-        Write-Log ("{0} installed file(s) differ from the expected Microsoft copy: {1}" -f $bad.Count, (($bad | ForEach-Object { $_.File }) -join ', ')) 'WARN'
+        Write-Log ("{0} installed file(s) do NOT match the expected Microsoft copy: {1}" -f $bad.Count, (($bad | ForEach-Object { $_.File }) -join ', ')) 'WARN'
     }
 }
 catch {
